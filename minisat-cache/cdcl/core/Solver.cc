@@ -1,0 +1,1840 @@
+/***************************************************************************************[Solver.cc]
+Copyright (c) 2003-2006, Niklas Een, Niklas Sorensson
+Copyright (c) 2007-2010, Niklas Sorensson
+
+Permission is hereby granted, free of charge, to any person obtaining a copy of this software and
+associated documentation files (the "Software"), to deal in the Software without restriction,
+including without limitation the rights to use, copy, modify, merge, publish, distribute,
+sublicense, and/or sell copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all copies or
+substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT
+NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
+NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM,
+DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT
+OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+**************************************************************************************************/
+
+#include <math.h>
+
+#include "mtl/Sort.h"
+#include "core/Solver.h"
+
+using namespace Minisat;
+
+//=================================================================================================
+// Options:
+
+
+static const char* _cat = "CORE";
+
+static DoubleOption  opt_var_decay         (_cat, "var-decay",   "The variable activity decay factor",            0.95,     DoubleRange(0, false, 1, false));
+static DoubleOption  opt_clause_decay      (_cat, "cla-decay",   "The clause activity decay factor",              0.999,    DoubleRange(0, false, 1, false));
+static DoubleOption  opt_random_var_freq   (_cat, "rnd-freq",    "The frequency with which the decision heuristic tries to choose a random variable", 0, DoubleRange(0, true, 1, true));
+static DoubleOption  opt_random_seed       (_cat, "rnd-seed",    "Used by the random variable selection",         91648253, DoubleRange(0, false, HUGE_VAL, false));
+static IntOption     opt_ccmin_mode        (_cat, "ccmin-mode",  "Controls conflict clause minimization (0=none, 1=basic, 2=deep)", 2, IntRange(0, 2));
+static IntOption     opt_phase_saving      (_cat, "phase-saving", "Controls the level of phase saving (0=none, 1=limited, 2=full)", 2, IntRange(0, 2));
+static BoolOption    opt_rnd_init_act      (_cat, "rnd-init",    "Randomize the initial activity", false);
+static BoolOption    opt_luby_restart      (_cat, "luby",        "Use the Luby restart sequence", true);
+static IntOption     opt_restart_first     (_cat, "rfirst",      "The base restart interval", 100, IntRange(1, INT32_MAX));
+static DoubleOption  opt_restart_inc       (_cat, "rinc",        "Restart interval increase factor", 2, DoubleRange(1, false, HUGE_VAL, false));
+static DoubleOption  opt_garbage_frac      (_cat, "gc-frac",     "The fraction of wasted memory allowed before a garbage collection is triggered",  0.20, DoubleRange(0, false, HUGE_VAL, false));
+
+
+//=================================================================================================
+// Constructor/Destructor:
+
+
+Solver::Solver() :
+
+    // Parameters (user settable):
+    //
+    verbosity        (0)
+  , var_decay        (opt_var_decay)
+  , clause_decay     (opt_clause_decay)
+  , random_var_freq  (opt_random_var_freq)
+  , random_seed      (opt_random_seed)
+  , luby_restart     (opt_luby_restart)
+  , ccmin_mode       (opt_ccmin_mode)
+  , phase_saving     (opt_phase_saving)
+  , rnd_pol          (false)
+  , rnd_init_act     (opt_rnd_init_act)
+  , garbage_frac     (opt_garbage_frac)
+  , restart_first    (opt_restart_first)
+  , restart_inc      (opt_restart_inc)
+
+    // Parameters (the rest):
+    //
+  , learntsize_factor((double)1/(double)3), learntsize_inc(1.1)
+
+    // Parameters (experimental):
+    //
+  , learntsize_adjust_start_confl (100)
+  , learntsize_adjust_inc         (1.5)
+
+    // Statistics: (formerly in 'SolverStats')
+    //
+  , solves(0), starts(0), decisions(0), rnd_decisions(0), propagations(0), conflicts(0)
+  , dec_vars(0), clauses_literals(0), learnts_literals(0), max_literals(0), tot_literals(0)
+
+  , ok                 (true)
+  , cla_inc            (1)
+  , var_inc            (1)
+  , watches            (WatcherDeleted(ca))
+  , qhead              (0)
+  , simpDB_assigns     (-1)
+  , simpDB_props       (0)
+  , order_heap         (VarOrderLt(activity))
+  , progress_estimate  (0)
+  , remove_satisfied   (true)
+
+    // Resource constraints:
+    //
+  , conflict_budget    (-1)
+  , propagation_budget (-1)
+  , asynch_interrupt   (false)
+{}
+
+
+Solver::~Solver()
+{
+}
+
+
+//=================================================================================================
+// Minor methods:
+
+
+// Creates a new SAT variable in the solver. If 'decision' is cleared, variable will not be
+// used as a decision variable (NOTE! This has effects on the meaning of a SATISFIABLE result).
+//
+Var Solver::newVar(bool sign, bool dvar)
+{   
+    int v = nVars();
+    watches  .init(mkLit(v, false));
+    watches  .init(mkLit(v, true ));
+    assigns  .push(l_Undef);
+    vardata  .push(mkVarData(CRef_Undef, 0));
+    //activity .push(0);
+    activity .push(rnd_init_act ? drand(random_seed) * 0.00001 : 0);
+    seen     .push(0);
+    polarity .push(sign);
+    decision .push();
+    trail    .capacity(v+1);
+    setDecisionVar(v, dvar);
+    return v;
+}
+
+
+bool Solver::addClause_(vec<Lit>& ps)
+{
+    assert(decisionLevel() == 0);
+    if (!ok) return false;
+
+    // Check if clause is satisfied and remove false/duplicate literals:
+    sort(ps);
+    Lit p; int i, j;
+    for (i = j = 0, p = lit_Undef; i < ps.size(); i++)
+        if (value(ps[i]) == l_True || ps[i] == ~p)
+            return true;
+        else if (value(ps[i]) != l_False && ps[i] != p)
+            ps[j++] = p = ps[i];
+    ps.shrink(i - j);
+
+    if (ps.size() > longuestClause) {
+        longuestClause = ps.size();
+    }
+    if (ps.size() == 0)
+        return ok = false;
+    else if (ps.size() == 1){
+        uncheckedEnqueue(ps[0]);
+        vardata[var(ps[0])].consider = false;
+        return ok = (propagate() == CRef_Undef);
+    }else{
+        CRef cr = ca.alloc(ps, false);
+        clauses.push(cr);
+        attachClause(cr);
+        allUsedClausesOriginal[cr] = clauses.size() - 1;
+    }
+
+    return true;
+}
+
+void Solver::printFormula() const {
+    for (int i = 0; i < clauses.size(); ++i) {
+        for (int j = 0; j < ca[clauses[i]].size(); ++j) {
+            printf("%d ", toLiteral(ca[clauses[i]][j]));
+        }
+        printf("0\n");
+    }
+}
+
+void Solver::printCache() const {
+    printf("\nprint the content of the cache: \n");
+    for (auto it = cache.begin(); it != cache.end(); ++it) {
+        if (config.allCache || it->second.isos) {
+            printf("c id: %d", it->second.id);
+            printf(", level: %d", it->second.level);
+            printf(", literals: %d", it->second.literals);
+            printf(", clauses: %d", it->second.clauses);
+            printf(", size: %d", it->second.size);
+            if (config.explorePrunedBranches) {
+                printf(", saved: %d", it->second.savedConflicts);
+            }
+                
+            printf(", isos: %d", it->second.isos);
+            printf(", levelIsos: [");
+            if (it->second.isos) {
+                auto itIsos = it->second.levelsIsos.begin();
+                printf("%d", *itIsos);
+                for (++itIsos; itIsos != it->second.levelsIsos.end(); ++itIsos) {
+                    printf(",%d", *itIsos);
+                }
+            }
+            printf("]");
+                
+            /*
+            auto itRequire = it->second.requirements.begin();
+            printf(", requirement: [%d->%d", itRequire->first, itRequire->second);
+            for (++itRequire; itRequire != it->second.requirements.end(); ++itRequire) {
+                printf(",%d->%d", itRequire->first, itRequire->second);
+            }
+            printf("]");
+            cout << ", component: " << it->first;
+            */
+            printf("\n");
+        }
+    }
+    printf("\n");
+}
+
+void Solver::attachClause(CRef cr) {
+    const Clause& c = ca[cr];
+    assert(c.size() > 1);
+    watches[~c[0]].push(Watcher(cr, c[1]));
+    watches[~c[1]].push(Watcher(cr, c[0]));
+    if (c.learnt()) learnts_literals += c.size();
+    else            clauses_literals += c.size(); }
+
+
+void Solver::detachClause(CRef cr, bool strict) {
+    const Clause& c = ca[cr];
+    assert(c.size() > 1);
+    
+    if (strict){
+        remove(watches[~c[0]], Watcher(cr, c[1]));
+        remove(watches[~c[1]], Watcher(cr, c[0]));
+    }else{
+        // Lazy detaching: (NOTE! Must clean all watcher lists before garbage collecting this clause)
+        watches.smudge(~c[0]);
+        watches.smudge(~c[1]);
+    }
+
+    if (c.learnt()) learnts_literals -= c.size();
+    else            clauses_literals -= c.size(); }
+
+
+void Solver::removeClause(CRef cr) {
+    Clause& c = ca[cr];
+    if (ca[cr].size() > 1) { 
+        detachClause(cr);
+    }
+    // Don't leave pointers to free'd memory!
+    if (locked(c)) vardata[var(c[0])].reason = CRef_Undef;
+    c.mark(1); 
+    ca.free(cr);
+}
+
+
+bool Solver::satisfied(const Clause& c) const {
+    for (int i = 0; i < c.size(); i++)
+        if (value(c[i]) == l_True)
+            return true;
+    return false; }
+
+
+// Revert to the state at given level (keeping all assignment at 'level' but not beyond).
+//
+void Solver::cancelUntil(int level) {
+    if (decisionLevel() > level){
+        if (config.makeDot && (config.showPrunedBranches || levelHit == -1)) {
+            while ((int)stack.size() > level + 1) {
+                stack.pop_back();
+            }
+            backtrackDot();
+            assertive = true;
+        }
+        for (int c = trail.size()-1; c >= trail_lim[level]; c--){
+            vardata[var(trail[c])].consider = true;
+            Var      x  = var(trail[c]);
+            assigns [x] = l_Undef;
+            if (phase_saving > 1 || (phase_saving == 1) && c > trail_lim.last())
+                polarity[x] = sign(trail[c]);
+            insertVarOrder(x); }
+        qhead = trail_lim[level];
+        trail.shrink(trail.size() - trail_lim[level]);
+        trail_lim.shrink(trail_lim.size() - level);
+    } }
+
+void Solver::readOrder(const string &path) {
+    ifstream in(path);
+    int lit;
+    if (in.fail()) {
+        throw runtime_error(string("File not found: ") + strerror(errno));
+    }
+    while (in.good()) {
+        in >> lit;
+        if (in.fail()) {
+            if (in.eof()) {
+                break;
+            }
+            throw runtime_error(string("Could not read a decision to force: ") + strerror(errno));
+        }
+        order.emplace_back(lit);
+    }
+    idxOrder = 0;
+}
+
+// Simplify and sort the literals of a clause
+void Solver::simplifyClause(const Clause &cl, const bool &descend, const bool &testEntry) {
+    for (int i = 0; i < cl.size(); ++i) {
+        if ((descend || !vardata[var(cl[i])].consider) && value(cl[i]) == l_True) {
+            if ((descend || testEntry) && config.generalizedIso) {
+                clause.emplace_back(toInt(cl[i]));
+            } else {
+                clause.clear();
+                satisfiedClause = true;
+                return;
+            }
+        }
+        else if ((descend && value(~cl[i]) == l_Undef) || (!descend && vardata[var(cl[i])].consider)) {
+            clause.emplace_back(toInt(cl[i]));
+        }
+        else if ((descend || testEntry) && config.generalizedIso) {
+            falsifiedLiterals.emplace_back(toInt(cl[i]));
+        }
+    }
+    if (!descend && !testEntry) {
+        sort(clause.begin(), clause.end());
+    }
+}
+
+// Simplify and sort the clauses of a formula
+void Solver::simplifyFormula(const bool &descend, const bool &testEntry) {
+    component = "";
+    litsComp = cls = size = nGroups = 0;
+    form.clear();
+    fill(clauseSizes.begin(), clauseSizes.end(), 0);
+    fill(foundLit.begin(), foundLit.end(), false);
+    
+    if (descend || testEntry) {
+        path = string("./cache/") + filename + string("_toTest.csv");
+    } else {
+        path = string("./cache/") + filename + string("_") + to_string(cache.size() + 1) + string(".csv");
+    }
+    ofstream out(path);
+    if (out.fail()) {
+        throw runtime_error(string("File not found: ") + strerror(errno));
+    }
+
+    if (config.printTrace) {
+        if (descend) {
+            cout << "Create formula" << endl;
+        } else {
+            cout << "New entry" << endl;
+        }
+    }
+
+    for (int i = 0; i < clauses.size(); ++i) {
+        if (descend || usedClauses[i]) {
+            if (config.generalizedIso) {
+                createNewGroup = true;
+            }
+            satisfiedClause = false;
+            clause.clear();
+            falsifiedLiterals.clear();
+            simplifyClause(ca[clauses[i]], descend, testEntry);
+            if (!clause.size()) {
+                if (!satisfiedClause) {
+                    component = "()";
+                    litsComp = cls = size = nGroups = 0;
+                    return;
+                }
+            }
+            else if (clause.size() == 1 && ((!descend && !testEntry) || !config.generalizedIso)) {
+                component = "()";
+                litsComp = cls = size = nGroups = 0;
+                return;
+            } 
+            else if (descend) {
+                possibleClauses.clear();
+                possibleClauses.emplace_back(clause);
+                if (config.generalizedIso) {
+                    createPossibleClauses();
+                }
+                for (unsigned j = 0; j < possibleClauses.size(); ++j) {
+                    if (possibleClauses[j].size() > 1) {
+                        size += possibleClauses[j].size();
+                        if (size > config.maxSizeComponent) {
+                            if (config.printTrace) {
+                                cout << "Max size exceeded (";
+                                if (config.generalizedIso) {
+                                    cout << nGroups << ", ";
+                                }
+                                cout << cls << ")" << endl;
+                            }
+                            component = "()";
+                            litsComp = cls = size = nGroups = 0;
+                            return;
+                        }
+                        ++cls;
+                        ++clauseSizes[possibleClauses[j].size()];
+                        for (unsigned k = 0; k < possibleClauses[j].size(); ++k) {
+                            if (config.generalizedIso) {
+                                out << "c" << i << "-" << j << ",l" << possibleClauses[j][k] << ",black" << endl;
+                            } else {
+                                out << "c" << i << ",l" << possibleClauses[j][k] << ",black" << endl;
+                            }
+                            if (out.fail()) {
+                                throw runtime_error(string("Could not write a clause for the graph: ") + strerror(errno));
+                            }
+                            if (!foundLit[possibleClauses[j][k]]) {
+                                ++litsComp;
+                                foundLit[possibleClauses[j][k]] = true;
+                                int neg = ((possibleClauses[j][k] & 1) ? (possibleClauses[j][k] - 1) : (possibleClauses[j][k] + 1));
+                                if (!foundLit[neg]) {
+                                    out << "l" << possibleClauses[j][k] << ",l" << neg << ",red" << endl << "l" << possibleClauses[j][k] << ",,lit" << endl << "l" << neg << ",,lit" << endl;
+                                    if (out.fail()) {
+                                        throw runtime_error(string("Could not write a boolean exclusion for the graph: ") + strerror(errno));
+                                    }
+                                }
+                            }
+                        }
+                        if (config.generalizedIso) {
+                            out << "c" << i << "-" << j << ",,s" << possibleClauses[j].size() << endl << "g" << i << ",c" << i << "-" << j << ",blue" << endl;
+                        } else {
+                            out << "c" << i << ",,s" << possibleClauses[j].size() << endl;
+                        }
+                        if (out.fail()) {
+                            throw runtime_error(string("Could not write a clause size for the graph: ") + strerror(errno));
+                        }
+                        if (config.generalizedIso && createNewGroup) {
+                            out << "g" << i << ",,g" << endl;
+                            if (out.fail()) {
+                                throw runtime_error(string("Could not create a new group in the graph: ") + strerror(errno));
+                            }
+                            createNewGroup = false;
+                            ++nGroups;
+                        }
+                    }
+                }
+            } else {
+                if (clause.size() > maxSizeClause) {
+                    maxSizeClause = clause.size();
+                }
+                possibleClauses.clear();
+                possibleClauses.emplace_back(clause);
+                if (config.generalizedIso && testEntry) {
+                    createPossibleClauses();
+                }
+                for (unsigned j = 0; j < possibleClauses.size(); ++j) {
+                    if (possibleClauses[j].size() > 1) {
+                        size += possibleClauses[j].size();
+                        if (size > config.maxSizeComponent) {
+                            if (config.printTrace) {
+                                cout << "Max size exceeded (";
+                                if (config.generalizedIso) {
+                                    cout << nGroups << ", ";
+                                }
+                                cout << cls << ")" << endl;
+                            }
+                            component = "()";
+                            litsComp = cls = size = nGroups = 0;
+                            return;
+                        }
+                        ++cls;
+                        ++clauseSizes[possibleClauses[j].size()];
+                        form.emplace_back(possibleClauses[j]);
+                    }
+                }
+            }
+        }
+    }
+    if (!descend) {
+        if (!testEntry) {
+            sort(form.begin(), form.end());
+        }
+        toGraphCSV(out);
+    }
+    if (config.printTrace) {
+        if (descend) {
+            cout << "Formula created (";
+            if (config.generalizedIso) {
+                cout << nGroups << ", ";
+            }
+            cout << cls << ")" << endl;
+        } else {
+            cout << "New entry created (";
+            if (config.generalizedIso) {
+                cout << nGroups << ", ";
+            }
+            cout << cls << ")" << endl;
+        }
+    }
+    out.close();
+}
+
+// Add the created component to the cache
+void Solver::storeComponent() {
+    unordered_map<string, ComponentStats>::iterator it;
+    if ((it = cache.find(component)) == cache.end()) {
+        ComponentStats &compStats = cache[component];
+        compStats.id = ++(stats.nCached);
+        compStats.level = decisionLevel();
+        compStats.isos = 0;
+        compStats.literals = litsComp;
+        compStats.clauses = cls;
+        compStats.size = size;
+        compStats.savedConflicts = 0;
+        for (unsigned i = 0; i < clauseSizes.size(); ++i) {
+            if (clauseSizes[i] > 0) {
+                compStats.requirements[i] = clauseSizes[i];
+            }
+        }
+        compStats.path = string("./cache/") + filename + string("_") + to_string(cache.size()) + string(".csv");
+        if (config.makeDot && !config.usePrecompiledCache) {
+            cachingDot();
+        }
+    }
+}
+
+// Check if the current formula has enough clauses of each size to try the isomorphism detection
+bool Solver::meetRequirements(unordered_map<int, int> &require) const {
+    unordered_map<int, int>::iterator it;
+    for (it = require.begin(); it != require.end(); ++it) {
+        if (clauseSizes[it->first] < it->second) {
+            return false;
+        }
+    }
+    return true;
+}
+
+inline double diffUserTime(struct rusage &start, struct rusage &end) {
+    return (end.ru_utime.tv_sec - start.ru_utime.tv_sec) +
+           1e-6*(end.ru_utime.tv_usec - start.ru_utime.tv_usec);
+}
+
+inline double diffSystemTime(struct rusage &start, struct rusage &end) {
+    return (end.ru_stime.tv_sec - start.ru_stime.tv_sec) +
+           1e-6*(end.ru_stime.tv_usec - start.ru_stime.tv_usec);
+}
+
+// Check if a specific component is an isomorhism of the current formula
+bool Solver::isIsomorphism(const string &pattern, const string &target) {
+    struct rusage start, end;
+    
+    ++stats.nGlasgowCalls;
+    if (config.printTrace) {
+        cout << "Call to Glasgow" << endl;
+    }
+    getrusage(RUSAGE_CHILDREN, &start);
+    if (system(("./glasgow_subgraph_solver --timeout " + to_string(config.timeoutIso) + " " + pattern +  " " + target + "  > ./" + filename + "_result.txt").c_str()) != 0) {
+        cerr << "Problem with the isomorphism solver" << endl;
+        printf("\nrestarts              : %" PRIu64"\n", starts);
+        printf("conflicts             : %-12" PRIu64"   (%.0f /sec)\n", conflicts   , conflicts   / cpuTime());
+        printf("decisions             : %-12" PRIu64"   (%4.2f %% random) (%.0f /sec)\n", decisions, (float)rnd_decisions*100 / (float)decisions, decisions / cpuTime());
+        printf("propagations          : %-12" PRIu64"   (%.0f /sec)\n", propagations, propagations / cpuTime());
+        printf("conflict literals     : %-12" PRIu64"   (%4.2f %% deleted)\n", tot_literals, (max_literals - tot_literals)*100 / (double)max_literals);
+        printf("components created    : %" PRIu64"\n", stats.nComponents);
+        printf("components cached     : %" PRIu64"\n", stats.nCached);
+        printf("isomorphisms          : %" PRIu64"\n", stats.nIsomorphisms);
+        if (config.explorePrunedBranches) {
+            printf("conflicts saved       : %" PRIu64"\n", stats.nSavedConflicts);
+            printf("conflicts remaining   : %" PRIu64"\n", stats.nRemainingConflicts);
+        }
+        printf("glasgow calls         : %" PRIu64"\n", stats.nGlasgowCalls);
+        printf("aborted calls         : %" PRIu64"\n", stats.nAborted);
+        if (memUsedPeak() != 0) printf("Memory used           : %.2f MB\n", memUsedPeak());
+        printf("CPU time              : %g s\n", cpuTime());
+        printf("total iso time        : %.6f s\n", totalIsoTime);
+        printCache();
+        exit(1);
+    }
+    getrusage(RUSAGE_CHILDREN, &end);
+    double diffTime = diffUserTime(start, end) + diffSystemTime(start, end);
+    totalIsoTime += diffTime;
+    isoTimes.emplace_back(diffTime);
+    if (config.printTrace) {
+        cout << "End of call to Glasgow (" << diffTime << " s)" << endl;
+    }
+
+    ifstream in("./" + filename + "_result.txt");
+    if (in.fail()) {
+        throw runtime_error(string("File not found: ") + strerror(errno));
+    }
+    string word, left, right;
+    char character;
+    int indexMapping;
+    do {
+        in >> word;
+        if (in.fail()) {
+            throw runtime_error(string("Status not found: ") + strerror(errno));
+        }
+    } while (word != "status");
+    in >> word >> word;
+    if (in.fail()) {
+        throw runtime_error(string("Could not read the status: ") + strerror(errno));
+    }
+    if (word == "aborted") {
+        if (config.printTrace) {
+            cout << "Aborted call" << endl;
+        }
+        ++stats.nAborted;
+        return false;
+    }
+    else if (word == "false") {
+        if (config.printTrace) {
+            cout << "Glasgow found nothing" << endl;
+        }
+        return false;
+    }
+    else if (config.explorePrunedBranches) {
+        return true;
+    }
+
+    if (config.printTrace) {
+        cout << "Isomorphism detected" << endl;
+    }
+    // Get the mapping
+    do {
+        in >> word;
+        if (in.fail()) {
+            throw runtime_error(string("Mapping not found: ") + strerror(errno));
+        }
+    } while (word != "mapping");
+    in >> word;
+    if (in.fail()) {
+        throw runtime_error(string("Could not read the '=' of the mapping: ") + strerror(errno));
+    }
+    for (;;) {
+        in >> left;
+        if (in.fail()) {
+            throw runtime_error(string("Could not read a left part of the mapping: ") + strerror(errno));
+        }
+        if (left == "runtime") {
+            break;
+        }
+        in >> word >> character >> indexMapping >> character;
+        if (in.fail()) {
+            throw runtime_error(string("Could not read a right part of the mapping: ") + strerror(errno));
+        }
+        if (left[1] == 'c') {
+            usedClauses[indexMapping] = true;
+            if (config.generalizedIso) {
+                in >> word;
+                if (in.fail()) {
+                    throw runtime_error(string("Could not finish to read the right part of the mapping: ") + strerror(errno));
+                }
+            }
+        }
+    }
+    in.close();
+    return true;
+}
+
+// Check if a component of the cache is an isomorphism of the current formula
+bool Solver::hasIsomorphism() {
+    unordered_map<string, ComponentStats>::iterator it;
+    for (it = cache.begin(); it != cache.end(); ++it) {
+        if ((!config.generalizedIso || nGroups >= it->second.clauses) && meetRequirements(it->second.requirements) && isIsomorphism(it->second.path, string("./cache/") + filename + string("_toTest.csv"))) {
+            ++it->second.isos;
+            ++stats.nIsomorphisms;
+            it->second.levelsIsos.emplace_back(decisionLevel());
+            usePath = it->second.path;
+            if (config.explorePrunedBranches) {
+                recognizedComponent = it->first;
+            }
+            if (config.makeDot) {
+                isoFoundDot(it->second.id);
+            }
+            return true;
+        }
+    }
+    return false;
+}
+
+// Collect the source of a conflict (i.e. the clauses that took part in the conflict)
+void Solver::collectUsedClauses(const CRef &conf) {
+    if (!ca[conf].learnt()) {
+        usedClauses[allUsedClausesOriginal[conf]] = true;
+    } else {
+        for (int i = 0; i < nClauses(); ++i) {
+            usedClauses[i] = usedClauses[i] || allUsedClausesLearnt[conf][i];
+        }
+    }
+    const Clause &cl = ca[conf];
+    for(int i = 0; i < cl.size(); ++i) {
+        if (assigns[var(cl[i])] != l_Undef) {
+            const CRef &r = reason(var(cl[i]));
+            if (r != CRef_Undef && !usedVariables[var(cl[i])]) {
+                usedVariables[var(cl[i])] = true;
+                collectUsedClauses(r);
+                if (!config.explorePrunedBranches && conflictIso) {
+                    varBumpActivity(var(cl[i]));
+                }
+            }
+        }
+    }
+}
+
+// Check if a learnt clause has been used to propagate the first literal of a clause
+bool Solver::checkClause(const CRef &r) const {
+    const Clause &cl = ca[r];
+    for (int i = 1; i < cl.size(); ++i) {
+        if (vardata[var(cl[i])].consider) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// Convert the current formula into a Graph (CSV format)
+void Solver::toGraphCSV(ofstream &out) {
+    component = "";
+    for (unsigned i = 0; i < form.size(); ++i) {
+        component += ((component != "") ? (",") : ("("));
+        for (unsigned j = 0; j < form[i].size(); ++j) {
+            if (config.generalizedIso) {
+                out << "c" << i << "-0" << ",l" << form[i][j] << ",black" << endl;
+            } else {
+                out << "c" << i << ",l" << form[i][j] << ",black" << endl;
+            }
+            if (out.fail()) {
+                throw runtime_error(string("Could not write a clause for the graph: ") + strerror(errno));
+            }
+            component += to_string(toLiteral(form[i][j])) + ",";
+            // component += to_string(form[i][j]) + ",";
+            if (!foundLit[form[i][j]]) {
+                ++litsComp;
+                foundLit[form[i][j]] = true;
+                int neg = ((form[i][j] & 1) ? (form[i][j] - 1) : (form[i][j] + 1));
+                if (!foundLit[neg]) {
+                    ++litsComp;
+                    foundLit[neg] = true;
+                    out << "l" << form[i][j] << ",l" << neg << ",red" << endl << "l" << form[i][j] << ",,lit" << endl << "l" << neg << ",,lit" << endl;
+                    if (out.fail()) {
+                        throw runtime_error(string("Could not write a boolean exclusion for the graph: ") + strerror(errno));
+                    }
+                }
+            }
+        }
+        if (config.generalizedIso) {
+            out << "c" << i << "-0,,s" << form[i].size() << endl << "g" << i << ",c" << i << "-0,blue" << endl << "g" << i << ",,g" << endl;
+        } else {
+            out << "c" << i << ",,s" << form[i].size() << endl;
+        }
+        if (out.fail()) {
+            throw runtime_error(string("Could not write a clause size for the graph: ") + strerror(errno));
+        }
+        component += "0";
+    }
+    if (component == "") {
+        component += "(";
+    }
+    component += ")";
+}
+
+// Delete all the files of the cache
+void Solver::clearCacheContent() {
+    unordered_map<string, ComponentStats>::iterator it;
+    for (it = cache.begin(); it != cache.end(); ++it) {
+        if (std::remove(it->second.path.c_str()) != 0) {
+            throw runtime_error(string("Could not delete a file in the cache: ") + strerror(errno));
+        }
+    }
+    if (stats.nGlasgowCalls > 0 && std::remove(("./cache/" + filename + "_toTest.csv").c_str()) != 0) {
+        cerr << "Could not delete toTest.csv" << endl;
+    }
+    if (stats.nGlasgowCalls > 0 && std::remove(("./" + filename + "_result.txt").c_str()) != 0) {
+        cerr << "Could not delete result.txt" << endl;
+    }
+}
+
+void Solver::createPossibleClauses() {
+    unsigned sz;
+    for (unsigned i = 0; i < falsifiedLiterals.size(); ++i) {
+        sz = possibleClauses.size();
+        for (unsigned j = 0; j < sz; ++j) {
+            if (possibleClauses[j].size() < maxSizeClause) {
+                vector<int> cl = possibleClauses[j];
+                cl.emplace_back(falsifiedLiterals[i]);
+                possibleClauses.emplace_back(cl);
+            }
+        }
+    }
+}
+
+void Solver::propagatingDot(const int &prop) {
+    string newName = currentNodeName + "." + to_string(prop) + "." + to_string(assertive);
+    string couleur;
+    int weight;
+    if (isRoot) {
+        outDOT << "\t\"" << currentNodeName << "\"[label=\"" << currentNodeName << "\"]" << endl;
+        if (outDOT.fail()) {
+            throw runtime_error(string("Could not create a new root in the DOT graph: ") + strerror(errno));
+        }
+    }
+    if (vardata[abs(prop) - 1].reason == CRef_Undef && decisionLevel() > 0) {
+        if (levelHit != -1) {
+            couleur = "darkgray";
+        } else {
+            couleur = "blue";
+        }
+        weight = 1;
+    } else {
+        if (levelHit != -1) {
+            couleur = "darkgray";
+        } else {
+            couleur = ((assertive) ? ("orange") : ("green"));   
+        }
+        weight = 100;
+    }
+    outDOT << "\t\"" << newName << "\"[label=\"" << prop << "\",shape=point,color=black]" << endl;
+    outDOT << "\t\"" << currentNodeName << "\" -- \"" << newName << "\"[label=\"" << prop << "\",fontcolor=" << couleur << ",color=" << couleur << ",style=bold,weight=" << weight << "]" << endl;
+    if (outDOT.fail()) {
+        throw runtime_error(string("Could not add a propagation in the DOT graph: ") + strerror(errno));
+    }
+    currentNodeName = newName;
+    assertive = isRoot = false;
+}
+
+void Solver::assumingDot(const int &dec) {
+    stack.push_back(currentNodeName);
+    if (sameLevelNodes.size() < starts || sameLevelNodes.empty()) {
+        sameLevelNodes.emplace_back(currentNodeName);
+    }
+    if (isRoot) {
+        outDOT << "\t\"" << currentNodeName << "\"[label=\"" << currentNodeName << "\"]" << endl;
+        if (outDOT.fail()) {
+            throw runtime_error(string("Could not create a new root in the DOT graph: ") + strerror(errno));
+        }
+    }
+    else if (!skipDecisionDot) {
+        outDOT << "\t\"" << currentNodeName << "\"[label=\"\",shape=point,color=black]" << endl;
+        if (outDOT.fail()) {
+            throw runtime_error(string("Could not add a new decision in the DOT graph: ") + strerror(errno));
+        }
+    }
+    isRoot = skipDecisionDot = false;
+}
+
+void Solver::backtrackDot() {
+    outDOT << "\t\"" << stack.back() << "\" -- \"" << currentNodeName << "\"[label=\"\",color=red,style=dotted]" << endl;
+    if (outDOT.fail()) {
+        throw runtime_error(string("Could not add a backtrack in the DOT graph: ") + strerror(errno));
+    }
+    currentNodeName = stack.back();
+    stack.pop_back();
+}
+
+void Solver::conflictFoundDot(const CRef &confl) {
+    string couleur = ((levelHit != -1) ? ("darkgray") : ("red"));
+    outDOT << "\t\"" << currentNodeName << "\"[label=\"" << toLiteral(ca[confl][0]);
+    for (int i = 1; i < ca[confl].size(); ++i) {
+        outDOT << " " << toLiteral(ca[confl][i]);
+    }
+    outDOT << "\",shape=box,color=\"" << couleur << "\",fontcolor=black,style=filled]" << endl;
+    if (outDOT.fail()) {
+        throw runtime_error(string("Could not add a conflict in the DOT graph: ") + strerror(errno));
+    }
+}
+
+void Solver::isoFoundDot(const int &idIso) {
+    string couleur = ((levelHit != -1) ? ("darkgray") : ("green"));
+    skipDecisionDot = true;
+    outDOT << "\t\"" << currentNodeName << "\"[label=\"i " << idIso << "\",shape=box,color=\"" << couleur << "\",fontcolor=black,style=filled]" << endl;
+    if (outDOT.fail()) {
+        throw runtime_error(string("Could not add an isomorphism detection in the DOT graph: ") + strerror(errno));
+    }
+}
+
+void Solver::cachingDot() {
+    string cachingName = currentNodeName + ".cache" + to_string(cache.size());
+    outDOT << "\t\"" << cachingName << "\"[label=\"cache " << cache.size() <<"\",shape=box,color=purple,fontcolor=white,style=filled]" << endl;
+    outDOT << "\t\"" << cachingName << "\" -- \"" << currentNodeName << "\"[label=\"\",color=darkgray,style=dotted]" << endl;
+    if (outDOT.fail()) {
+        throw runtime_error(string("Could not add a new cache entry in the DOT graph: ") + strerror(errno));
+    }
+}
+
+void Solver::compileCache() {
+    int lit, translate;
+    string file;
+    form.clear();
+    clause.clear();
+    litsComp = cls = size = 0;
+    fill(foundLit.begin(), foundLit.end(), false);
+    fill(clauseSizes.begin(), clauseSizes.end(), 0);
+    ifstream inCompile("./precompile.txt");
+    if (inCompile.fail()) {
+        throw runtime_error(string("File not found: ") + strerror(errno));
+    }
+    while (inCompile.good()) {
+        inCompile >> file;
+        if (inCompile.fail()) {
+            if (inCompile.eof()) {
+                break;
+            }
+            throw runtime_error(string("Could not read a path of a file: ") + strerror(errno));
+        }
+        ifstream inFile(file);
+        if (inFile.fail()) {
+            throw runtime_error(string("File not found: ") + strerror(errno));
+        }
+        while (inFile.good()) {
+            inFile >> lit;
+            if (inFile.fail()) {
+                if (inFile.eof()) {
+                    inFile.close();
+                    break;
+                }
+                throw runtime_error(string("Could not read a literal in a precompiled component: ") + strerror(errno));
+            }
+            if (lit == 0) {                    
+                ++cls;
+                sort(clause.begin(), clause.end());
+                form.emplace_back(clause);
+                ++clauseSizes[clause.size()];
+                clause.clear();
+            } else {
+                ++size;
+                if (size > config.maxSizeComponent) {
+                    inFile.close();
+                    break;
+                }
+                translate = (abs(lit) - 1) << 1;
+                if (lit < 0) {
+                    ++translate;
+                }
+                clause.emplace_back(translate);
+                if (!foundLit[translate]) {
+                    ++litsComp;
+                    foundLit[translate] = true;
+                }
+            }
+        }
+        if (size <= config.maxSizeComponent) {
+            sort(form.begin(), form.end());
+            component = "";
+            for (unsigned i = 0; i < form.size(); ++i) {
+                component += ((component != "") ? (",") : ("("));
+                for (unsigned j = 0; j < form[i].size(); ++j) {
+                    component += to_string(toLiteral(form[i][j])) + ",";
+                }
+                component += "0";
+            }
+            component += ")";
+            storeComponent();
+        }
+        fill(foundLit.begin(), foundLit.end(), false);
+        ofstream outCompile("./cache/" + filename + "_" + to_string(cache.size()) + ".csv");
+        toGraphCSV(outCompile);
+        litsComp = cls = size = 0;
+        fill(foundLit.begin(), foundLit.end(), false);
+        fill(clauseSizes.begin(), clauseSizes.end(), 0);
+        form.clear();
+    }
+}
+
+
+//=================================================================================================
+// Major methods:
+
+
+Lit Solver::pickBranchLit()
+{
+    if (config.forceOrder && levelHit == -1 && idxOrder < (int)order.size()) {
+        int n = order[idxOrder++];
+        Var next = abs(n) - 1;
+        return mkLit(next, (n < 0));
+    } else {
+        Var next = var_Undef;
+
+        // Random decision:
+        if (drand(random_seed) < random_var_freq && !order_heap.empty()){
+            next = order_heap[irand(random_seed,order_heap.size())];
+            if (value(next) == l_Undef && decision[next])
+                rnd_decisions++; }
+
+        // Activity based decision:
+        while (next == var_Undef || value(next) != l_Undef || !decision[next])
+            if (order_heap.empty()){
+                next = var_Undef;
+                break;
+            }else
+                next = order_heap.removeMin();
+
+        return next == var_Undef ? lit_Undef : mkLit(next, rnd_pol ? drand(random_seed) < 0.5 : polarity[next]);
+    }
+}
+
+
+/*_________________________________________________________________________________________________
+|
+|  analyze : (confl : Clause*) (out_learnt : vec<Lit>&) (out_btlevel : int&)  ->  [void]
+|  
+|  Description:
+|    Analyze conflict and produce a reason clause.
+|  
+|    Pre-conditions:
+|      * 'out_learnt' is assumed to be cleared.
+|      * Current decision level must be greater than root level.
+|  
+|    Post-conditions:
+|      * 'out_learnt[0]' is the asserting literal at level 'out_btlevel'.
+|      * If out_learnt.size() > 1 then 'out_learnt[1]' has the greatest decision level of the 
+|        rest of literals. There may be others from the same level though.
+|  
+|________________________________________________________________________________________________@*/
+void Solver::analyze(CRef confl, vec<Lit>& out_learnt, int& out_btlevel)
+{
+    int pathC = 0;
+    Lit p     = lit_Undef;
+
+    // Generate conflict clause:
+    //
+    out_learnt.push();      // (leave room for the asserting literal)
+    int index   = trail.size() - 1;
+
+    do{
+        assert(confl != CRef_Undef); // (otherwise should be UIP)
+        Clause& c = ca[confl];
+
+        if (c.learnt())
+            claBumpActivity(c);
+
+        for (int j = (p == lit_Undef) ? 0 : 1; j < c.size(); j++){
+            Lit q = c[j];
+
+            if (!seen[var(q)] && level(var(q)) > 0){
+                varBumpActivity(var(q));
+                seen[var(q)] = 1;
+                if (level(var(q)) >= decisionLevel())
+                    pathC++;
+                else
+                    out_learnt.push(q);
+            }
+        }
+        
+        // Select next clause to look at:
+        while (!seen[var(trail[index--])]);
+        p     = trail[index+1];
+        confl = reason(var(p));
+        seen[var(p)] = 0;
+        pathC--;
+
+    }while (pathC > 0);
+    out_learnt[0] = ~p;
+
+    // Simplify conflict clause:
+    //
+    int i, j;
+    out_learnt.copyTo(analyze_toclear);
+    if (ccmin_mode == 2){
+        uint32_t abstract_level = 0;
+        for (i = 1; i < out_learnt.size(); i++)
+            abstract_level |= abstractLevel(var(out_learnt[i])); // (maintain an abstraction of levels involved in conflict)
+
+        for (i = j = 1; i < out_learnt.size(); i++)
+            if (reason(var(out_learnt[i])) == CRef_Undef || !litRedundant(out_learnt[i], abstract_level))
+                out_learnt[j++] = out_learnt[i];
+        
+    }else if (ccmin_mode == 1){
+        for (i = j = 1; i < out_learnt.size(); i++){
+            Var x = var(out_learnt[i]);
+
+            if (reason(x) == CRef_Undef)
+                out_learnt[j++] = out_learnt[i];
+            else{
+                Clause& c = ca[reason(var(out_learnt[i]))];
+                for (int k = 1; k < c.size(); k++)
+                    if (!seen[var(c[k])] && level(var(c[k])) > 0){
+                        out_learnt[j++] = out_learnt[i];
+                        break; }
+            }
+        }
+    }else
+        i = j = out_learnt.size();
+
+    max_literals += out_learnt.size();
+    out_learnt.shrink(i - j);
+    tot_literals += out_learnt.size();
+
+    // Find correct backtrack level:
+    //
+    if (out_learnt.size() == 1)
+        out_btlevel = 0;
+    else{
+        int max_i = 1;
+        // Find the first literal assigned at the next-highest level:
+        for (int i = 2; i < out_learnt.size(); i++)
+            if (level(var(out_learnt[i])) > level(var(out_learnt[max_i])))
+                max_i = i;
+        // Swap-in this literal at index 1:
+        Lit p             = out_learnt[max_i];
+        out_learnt[max_i] = out_learnt[1];
+        out_learnt[1]     = p;
+        out_btlevel       = level(var(p));
+    }
+
+    for (int j = 0; j < analyze_toclear.size(); j++) seen[var(analyze_toclear[j])] = 0;    // ('seen[]' is now cleared)
+}
+
+
+// Check if 'p' can be removed. 'abstract_levels' is used to abort early if the algorithm is
+// visiting literals at levels that cannot be removed later.
+bool Solver::litRedundant(Lit p, uint32_t abstract_levels)
+{
+    analyze_stack.clear(); analyze_stack.push(p);
+    int top = analyze_toclear.size();
+    while (analyze_stack.size() > 0){
+        assert(reason(var(analyze_stack.last())) != CRef_Undef);
+        Clause& c = ca[reason(var(analyze_stack.last()))]; analyze_stack.pop();
+
+        for (int i = 1; i < c.size(); i++){
+            Lit p  = c[i];
+            if (!seen[var(p)] && level(var(p)) > 0){
+                if (reason(var(p)) != CRef_Undef && (abstractLevel(var(p)) & abstract_levels) != 0){
+                    seen[var(p)] = 1;
+                    analyze_stack.push(p);
+                    analyze_toclear.push(p);
+                }else{
+                    for (int j = top; j < analyze_toclear.size(); j++)
+                        seen[var(analyze_toclear[j])] = 0;
+                    analyze_toclear.shrink(analyze_toclear.size() - top);
+                    return false;
+                }
+            }
+        }
+    }
+
+    return true;
+}
+
+
+/*_________________________________________________________________________________________________
+|
+|  analyzeFinal : (p : Lit)  ->  [void]
+|  
+|  Description:
+|    Specialized analysis procedure to express the final conflict in terms of assumptions.
+|    Calculates the (possibly empty) set of assumptions that led to the assignment of 'p', and
+|    stores the result in 'out_conflict'.
+|________________________________________________________________________________________________@*/
+void Solver::analyzeFinal(Lit p, vec<Lit>& out_conflict)
+{
+    out_conflict.clear();
+    out_conflict.push(p);
+
+    if (decisionLevel() == 0)
+        return;
+
+    seen[var(p)] = 1;
+
+    for (int i = trail.size()-1; i >= trail_lim[0]; i--){
+        Var x = var(trail[i]);
+        if (seen[x]){
+            if (reason(x) == CRef_Undef){
+                assert(level(x) > 0);
+                out_conflict.push(~trail[i]);
+            }else{
+                Clause& c = ca[reason(x)];
+                for (int j = 1; j < c.size(); j++)
+                    if (level(var(c[j])) > 0)
+                        seen[var(c[j])] = 1;
+            }
+            seen[x] = 0;
+        }
+    }
+
+    seen[var(p)] = 0;
+}
+
+
+void Solver::uncheckedEnqueue(Lit p, CRef from)
+{
+    assert(value(p) == l_Undef);
+    assigns[var(p)] = lbool(!sign(p));
+    vardata[var(p)] = mkVarData(from, decisionLevel());
+    trail.push_(p);
+}
+
+
+/*_________________________________________________________________________________________________
+|
+|  propagate : [void]  ->  [Clause*]
+|  
+|  Description:
+|    Propagates all enqueued facts. If a conflict arises, the conflicting clause is returned,
+|    otherwise CRef_Undef.
+|  
+|    Post-conditions:
+|      * the propagation queue is empty, even if there was a conflict.
+|________________________________________________________________________________________________@*/
+CRef Solver::propagate()
+{
+    CRef    confl     = CRef_Undef;
+    int     num_props = 0;
+    watches.cleanAll();
+
+    while (qhead < trail.size()){
+        Lit            p   = trail[qhead++];     // 'p' is enqueued fact to propagate.
+        vec<Watcher>&  ws  = watches[p];
+        Watcher        *i, *j, *end;
+        num_props++;
+        if (config.makeDot && (config.showPrunedBranches || levelHit == -1)) {
+            propagatingDot(toLiteral(p));
+        }
+
+        for (i = j = (Watcher*)ws, end = i + ws.size();  i != end;){
+            // Try to avoid inspecting the clause:
+            Lit blocker = i->blocker;
+            if (value(blocker) == l_True){
+                *j++ = *i++; continue; }
+
+            // Make sure the false literal is data[1]:
+            CRef     cr        = i->cref;
+            Clause&  c         = ca[cr];
+            Lit      false_lit = ~p;
+            if (c[0] == false_lit)
+                c[0] = c[1], c[1] = false_lit;
+            assert(c[1] == false_lit);
+            i++;
+
+            // If 0th watch is true, then clause is already satisfied.
+            Lit     first = c[0];
+            Watcher w     = Watcher(cr, first);
+            if (first != blocker && value(first) == l_True){
+                *j++ = w; continue; }
+
+            // Look for new watch:
+            for (int k = 2; k < c.size(); k++)
+                if (value(c[k]) != l_False){
+                    c[1] = c[k]; c[k] = false_lit;
+                    watches[~c[1]].push(w);
+                    goto NextClause; }
+
+            // Did not find watch -- clause is unit under assignment:
+            *j++ = w;
+            if (value(first) == l_False){
+                confl = cr;
+                qhead = trail.size();
+                // Copy the remaining watches:
+                while (i < end)
+                    *j++ = *i++;
+            }else {
+                uncheckedEnqueue(first, cr);
+                if (!ca[cr].learnt()) {
+                    vardata[var(first)].consider = checkClause(cr);
+                }
+            }
+
+        NextClause:;
+        }
+        ws.shrink(i - j);
+    }
+    propagations += num_props;
+    simpDB_props -= num_props;
+
+    return confl;
+}
+
+
+/*_________________________________________________________________________________________________
+|
+|  reduceDB : ()  ->  [void]
+|  
+|  Description:
+|    Remove half of the learnt clauses, minus the clauses locked by the current assignment. Locked
+|    clauses are clauses that are reason to some assignment. Binary clauses are never removed.
+|________________________________________________________________________________________________@*/
+struct reduceDB_lt { 
+    ClauseAllocator& ca;
+    reduceDB_lt(ClauseAllocator& ca_) : ca(ca_) {}
+    bool operator () (CRef x, CRef y) { 
+        return ca[x].size() > 2 && (ca[y].size() == 2 || ca[x].activity() < ca[y].activity()); } 
+};
+void Solver::reduceDB()
+{
+    int     i, j;
+    double  extra_lim = cla_inc / learnts.size();    // Remove any clause below this activity
+
+    sort(learnts, reduceDB_lt(ca));
+    // Don't delete binary or locked clauses. From the rest, delete clauses from the first half
+    // and clauses with activity smaller than 'extra_lim':
+    for (i = j = 0; i < learnts.size(); i++){
+        Clause& c = ca[learnts[i]];
+        if (c.size() > 2 && !locked(c) && (i < learnts.size() / 2 || c.activity() < extra_lim))
+            removeClause(learnts[i]);
+        else
+            learnts[j++] = learnts[i];
+    }
+    learnts.shrink(i - j);
+    checkGarbage();
+}
+
+
+void Solver::removeSatisfied(vec<CRef>& cs)
+{
+    int i, j;
+    for (i = j = 0; i < cs.size(); i++){
+        Clause& c = ca[cs[i]];
+        if (satisfied(c))
+            removeClause(cs[i]);
+        else
+            cs[j++] = cs[i];
+    }
+    cs.shrink(i - j);
+}
+
+
+void Solver::rebuildOrderHeap()
+{
+    vec<Var> vs;
+    for (Var v = 0; v < nVars(); v++)
+        if (decision[v] && value(v) == l_Undef)
+            vs.push(v);
+    order_heap.build(vs);
+}
+
+
+/*_________________________________________________________________________________________________
+|
+|  simplify : [void]  ->  [bool]
+|  
+|  Description:
+|    Simplify the clause database according to the current top-level assigment. Currently, the only
+|    thing done here is the removal of satisfied clauses, but more things can be put here.
+|________________________________________________________________________________________________@*/
+bool Solver::simplify()
+{
+    assert(decisionLevel() == 0);
+
+    if (!ok || propagate() != CRef_Undef)
+        return ok = false;
+
+    if (nAssigns() == simpDB_assigns || (simpDB_props > 0))
+        return true;
+
+    /* We do not want to delete clauses
+    // Remove satisfied clauses:
+    removeSatisfied(learnts);
+    if (remove_satisfied)        // Can be turned off.
+        removeSatisfied(clauses);
+    */
+
+    checkGarbage();
+    rebuildOrderHeap();
+
+    simpDB_assigns = nAssigns();
+    simpDB_props   = clauses_literals + learnts_literals;   // (shouldn't depend on stats really, but it will do for now)
+
+    return true;
+}
+
+
+/*_________________________________________________________________________________________________
+|
+|  search : (nof_conflicts : int) (params : const SearchParams&)  ->  [lbool]
+|  
+|  Description:
+|    Search for a model the specified number of conflicts. 
+|    NOTE! Use negative value for 'nof_conflicts' indicate infinity.
+|  
+|  Output:
+|    'l_True' if a partial assigment that is consistent with respect to the clauseset is found. If
+|    all variables are decision variables, this means that the clause set is satisfiable. 'l_False'
+|    if the clause set is unsatisfiable. 'l_Undef' if the bound on number of conflicts is reached.
+|________________________________________________________________________________________________@*/
+lbool Solver::search(int nof_conflicts)
+{
+    assert(ok);
+    int         backtrack_level;
+    int         conflictC = 0;
+    vec<Lit>    learnt_clause;
+    starts++;
+
+    for (;;){
+        CRef confl = propagate();
+
+        if (confl == CRef_Undef && cache.size() && levelHit == -1) {
+            ++stats.nComponents;
+            simplifyFormula(true, false);
+            // cout << "descend component: " << component << endl;
+
+            fill(usedClauses.begin(), usedClauses.end(), false);
+            if (component != "()" && hasIsomorphism()) {
+                ++stats.nRemainingConflicts;
+                if (!config.explorePrunedBranches) {
+                    conflictIso = true;
+                    // Construct the conflict
+                    vec<Lit> newConflict;
+                    backtrack_level = -1;
+                    fill(foundLit.begin(), foundLit.end(), false);
+                    for (int i = 0; i < clauses.size(); ++i) {
+                        if (usedClauses[i]) {
+                            for (int j = 0; j < ca[clauses[i]].size(); ++j) {
+                                if (value(ca[clauses[i]][j]) == l_False && !foundLit[toInt(ca[clauses[i]][j])]) {
+                                    newConflict.push(ca[clauses[i]][j]);
+                                    foundLit[toInt(ca[clauses[i]][j])] = true;
+                                    if (level(var(ca[clauses[i]][j])) > backtrack_level) {
+                                        backtrack_level = level(var(ca[clauses[i]][j]));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    confl = ca.alloc(newConflict, false);
+                    if (backtrack_level != -1 && backtrack_level < decisionLevel()) {
+                        cancelUntil(backtrack_level);
+                    }
+
+                    // Complete the sources
+                    fill(usedVariables.begin(), usedVariables.end(), false);
+                    for (int i = 0; i < clauses.size(); ++i) {
+                        if (usedClauses[i]) {
+                            collectUsedClauses(clauses[i]);
+                        }
+                    }
+                } else {
+                    levelHit = decisionLevel();
+                }
+            }
+        }
+        
+        if (confl != CRef_Undef){
+            // CONFLICT
+            conflicts++; conflictC++;
+            if (config.printTrace) {
+                cout << "Conflict" << endl;
+            }
+            if (config.explorePrunedBranches) {
+                if (levelHit == -1) {
+                    ++stats.nRemainingConflicts;
+                } else {
+                    ++stats.nSavedConflicts;
+                    ++cache[recognizedComponent].savedConflicts;
+                }
+            }
+
+            if (!conflictIso) {
+                if (config.makeDot && (config.showPrunedBranches || levelHit == -1)) {
+                    conflictFoundDot(confl);
+                }
+                fill(usedClauses.begin(), usedClauses.end(), false);
+                fill(usedVariables.begin(), usedVariables.end(), false);
+                collectUsedClauses(confl);
+            } else {
+                conflictIso = false;
+            }
+
+            if (decisionLevel() == 0) return l_False;
+
+            learnt_clause.clear();
+            analyze(confl, learnt_clause, backtrack_level);
+            if (backtrack_level < levelHit) {
+                levelHit = -1;
+            }
+            if (!config.usePrecompiledCache && (levelHit == -1 || config.acceptAfterHit)) {
+                if (!config.generalizedIso) {
+                    simplifyFormula(false, false);
+                    // cout << "store component: " << component << endl;
+                    if (component != "()" && (usePath == "" || !isIsomorphism(usePath, string("./cache/") + filename + string("_") + to_string(cache.size() + 1) + string(".csv")))) {
+                        storeComponent();
+                    }
+                    if (levelHit == -1 && usePath != "") {
+                        usePath = "";
+                    }
+                } else {
+                    if (usePath == "") {
+                        component = "()";
+                    } else {
+                        simplifyFormula(false, true);
+                    }
+                    // cout << "test component: " << component << endl;
+                    if (component == "()" || usePath == "" || !isIsomorphism(usePath, string("./cache/" + filename + string("_toTest.csv")))) {
+                        simplifyFormula(false, false);
+                        // cout << "store component: " << component << endl;
+                        if (component != "()") {
+                            storeComponent();
+                        }
+                        if (levelHit == -1 && usePath != "") {
+                            usePath = "";
+                        }
+                    }
+                }
+            }
+            cancelUntil(backtrack_level);
+
+            CRef cr = ca.alloc(learnt_clause, true);
+            learnts.push(cr);
+            if (learnt_clause.size() > 1) {
+                attachClause(cr);
+            }
+            claBumpActivity(ca[cr]);
+            uncheckedEnqueue(learnt_clause[0], cr);
+            allUsedClausesLearnt[cr] = usedClauses;
+
+            varDecayActivity();
+            claDecayActivity();
+
+            if (--learntsize_adjust_cnt == 0){
+                learntsize_adjust_confl *= learntsize_adjust_inc;
+                learntsize_adjust_cnt    = (int)learntsize_adjust_confl;
+                max_learnts             *= learntsize_inc;
+
+                if (verbosity >= 1)
+                    printf("| %9d | %7d %8d %8d | %8d %8d %6.0f | %6.3f %% |\n", 
+                           (int)conflicts, 
+                           (int)dec_vars - (trail_lim.size() == 0 ? trail.size() : trail_lim[0]), nClauses(), (int)clauses_literals, 
+                           (int)max_learnts, nLearnts(), (double)learnts_literals/nLearnts(), progressEstimate()*100);
+            }
+
+        }else{
+            // NO CONFLICT
+            
+            if (config.useRestarts && nof_conflicts >= 0 && conflictC >= nof_conflicts || !withinBudget()){
+                // Reached bound on number of conflicts:
+                progress_estimate = progressEstimate();
+                cancelUntil(0);
+                stack.clear();
+                return l_Undef; }
+            
+            // Simplify the set of problem clauses:
+            if (decisionLevel() == 0 && !simplify())
+                return l_False;
+
+            if (learnts.size()-nAssigns() >= max_learnts)
+                // Reduce the set of learnt clauses:
+                reduceDB();
+
+            Lit next = lit_Undef;
+            while (decisionLevel() < assumptions.size()){
+                // Perform user provided assumption:
+                Lit p = assumptions[decisionLevel()];
+                if (value(p) == l_True){
+                    // Dummy decision level:
+                    newDecisionLevel();
+                }else if (value(p) == l_False){
+                    analyzeFinal(~p, conflict);
+                    return l_False;
+                }else{
+                    next = p;
+                    break;
+                }
+            }
+
+            if (next == lit_Undef){
+                // New variable decision:
+                decisions++;
+                next = pickBranchLit();
+                if (next == lit_Undef)
+                    // Model found:
+                    return l_True;
+            }
+
+            // Increase decision level and enqueue 'next'
+            if (config.makeDot && (config.showPrunedBranches || levelHit == -1)) {
+                assumingDot(toLiteral(next));
+            }
+            newDecisionLevel();
+            uncheckedEnqueue(next);
+            vardata[var(next)].consider = false;
+            if (config.printTrace) {
+                cout << "Decision: " << toLiteral(next) << endl;
+            }
+        }
+    }
+}
+
+
+double Solver::progressEstimate() const
+{
+    double  progress = 0;
+    double  F = 1.0 / nVars();
+
+    for (int i = 0; i <= decisionLevel(); i++){
+        int beg = i == 0 ? 0 : trail_lim[i - 1];
+        int end = i == decisionLevel() ? trail.size() : trail_lim[i];
+        progress += pow(F, i) * (end - beg);
+    }
+
+    return progress / nVars();
+}
+
+/*
+  Finite subsequences of the Luby-sequence:
+
+  0: 1
+  1: 1 1 2
+  2: 1 1 2 1 1 2 4
+  3: 1 1 2 1 1 2 4 1 1 2 1 1 2 4 8
+  ...
+
+
+ */
+
+static double luby(double y, int x){
+
+    // Find the finite subsequence that contains index 'x', and the
+    // size of that subsequence:
+    int size, seq;
+    for (size = 1, seq = 0; size < x+1; seq++, size = 2*size+1);
+
+    while (size-1 != x){
+        size = (size-1)>>1;
+        seq--;
+        x = x % size;
+    }
+
+    return pow(y, seq);
+}
+
+// NOTE: assumptions passed in member-variable 'assumptions'.
+lbool Solver::solve_()
+{
+    model.clear();
+    conflict.clear();
+    if (!ok) return l_False;
+
+    solves++;
+
+    max_learnts               = nClauses() * learntsize_factor;
+    learntsize_adjust_confl   = learntsize_adjust_start_confl;
+    learntsize_adjust_cnt     = (int)learntsize_adjust_confl;
+    lbool   status            = l_Undef;
+
+    if (verbosity >= 1){
+        printf("============================[ Search Statistics ]==============================\n");
+        printf("| Conflicts |          ORIGINAL         |          LEARNT          | Progress |\n");
+        printf("|           |    Vars  Clauses Literals |    Limit  Clauses Lit/Cl |          |\n");
+        printf("===============================================================================\n");
+    }
+    // Search:
+    int curr_restarts = 0;
+    totalIsoTime = 0;
+    conflictIso = false;
+    usedClauses.resize(nClauses());
+    usedVariables.resize(nVars());
+    clauseSizes.resize(100);
+    if (!config.usePrecompiledCache) {
+        foundLit.resize(nVars() << 1);
+    } else {
+        foundLit.resize(config.maxSizeComponent << 1);
+    }
+    if (config.forceOrder) {
+        readOrder("./order.txt");
+    }
+    if (config.usePrecompiledCache) {
+        compileCache();
+    }
+    while (status == l_Undef){
+        double rest_base = luby_restart ? luby(restart_inc, curr_restarts) : pow(restart_inc, curr_restarts);
+        if (config.makeDot) {
+            skipDecisionDot = false;
+            isRoot = true;
+        }
+        usePath = "";
+        status = search(rest_base * restart_first);
+        if (!withinBudget()) break;
+        curr_restarts++;
+        if (config.makeDot) {
+            currentNodeName = string("R") + to_string(starts);
+        }
+    }
+
+    printf("\niso times:");
+    for (unsigned i = 0; i < isoTimes.size(); ++i) {
+        printf(" %.6f", isoTimes[i]);
+    }
+    printf("\n\ntotal iso time: %.6f\n", totalIsoTime);
+
+    if (config.makeDot) {
+        if (sameLevelNodes.size() > 0) {
+            outDOT << "\t{ rank = same;" << endl;
+            if (outDOT.fail()) {
+                throw runtime_error(string("Could not declare the level of the roots: ") + strerror(errno));
+            }
+            for (unsigned i = 0; i < sameLevelNodes.size(); ++i) {
+                outDOT << "\t\"" << sameLevelNodes[i] << "\";" << endl;
+                if (outDOT.fail()) {
+                    throw runtime_error(string("Could not write one of the roots: ") + strerror(errno));
+                }
+            }
+            outDOT << "\t}" << endl;
+        }
+        outDOT << "}" << endl;
+    }
+
+    if (verbosity >= 1)
+        printf("===============================================================================\n");
+
+    if (status == l_True){
+        // Extend & copy model:
+        model.growTo(nVars());
+        for (int i = 0; i < nVars(); i++) model[i] = value(i);
+    }else if (status == l_False && conflict.size() == 0)
+        ok = false;
+
+    cancelUntil(0);
+    if (config.clearCache) {
+        clearCacheContent();
+    }
+    return status;
+}
+
+//=================================================================================================
+// Writing CNF to DIMACS:
+// 
+// FIXME: this needs to be rewritten completely.
+
+static Var mapVar(Var x, vec<Var>& map, Var& max)
+{
+    if (map.size() <= x || map[x] == -1){
+        map.growTo(x+1, -1);
+        map[x] = max++;
+    }
+    return map[x];
+}
+
+
+void Solver::toDimacs(FILE* f, Clause& c, vec<Var>& map, Var& max)
+{
+    if (satisfied(c)) return;
+
+    for (int i = 0; i < c.size(); i++)
+        if (value(c[i]) != l_False)
+            fprintf(f, "%s%d ", sign(c[i]) ? "-" : "", mapVar(var(c[i]), map, max)+1);
+    fprintf(f, "0\n");
+}
+
+
+void Solver::toDimacs(const char *file, const vec<Lit>& assumps)
+{
+    FILE* f = fopen(file, "wr");
+    if (f == NULL)
+        fprintf(stderr, "could not open file %s\n", file), exit(1);
+    toDimacs(f, assumps);
+    fclose(f);
+}
+
+
+void Solver::toDimacs(FILE* f, const vec<Lit>& assumps)
+{
+    // Handle case when solver is in contradictory state:
+    if (!ok){
+        fprintf(f, "p cnf 1 2\n1 0\n-1 0\n");
+        return; }
+
+    vec<Var> map; Var max = 0;
+
+    // Cannot use removeClauses here because it is not safe
+    // to deallocate them at this point. Could be improved.
+    int cnt = 0;
+    for (int i = 0; i < clauses.size(); i++)
+        if (!satisfied(ca[clauses[i]]))
+            cnt++;
+        
+    for (int i = 0; i < clauses.size(); i++)
+        if (!satisfied(ca[clauses[i]])){
+            Clause& c = ca[clauses[i]];
+            for (int j = 0; j < c.size(); j++)
+                if (value(c[j]) != l_False)
+                    mapVar(var(c[j]), map, max);
+        }
+
+    // Assumptions are added as unit clauses:
+    cnt += assumptions.size();
+
+    fprintf(f, "p cnf %d %d\n", max, cnt);
+
+    for (int i = 0; i < assumptions.size(); i++){
+        assert(value(assumptions[i]) != l_False);
+        fprintf(f, "%s%d 0\n", sign(assumptions[i]) ? "-" : "", mapVar(var(assumptions[i]), map, max)+1);
+    }
+
+    for (int i = 0; i < clauses.size(); i++)
+        toDimacs(f, ca[clauses[i]], map, max);
+
+    if (verbosity > 0)
+        printf("Wrote %d clauses with %d variables.\n", cnt, max);
+}
+
+
+//=================================================================================================
+// Garbage Collection methods:
+
+void Solver::relocAll(ClauseAllocator& to)
+{
+    CRef old;
+    unordered_map<CRef, int> newUsedOriginal;
+    unordered_map<CRef, vector<bool>> newUsedLearnt;
+    // All watchers:
+    //
+    // for (int i = 0; i < watches.size(); i++)
+    watches.cleanAll();
+    for (int v = 0; v < nVars(); v++)
+        for (int s = 0; s < 2; s++){
+            Lit p = mkLit(v, s);
+            // printf(" >>> RELOCING: %s%d\n", sign(p)?"-":"", var(p)+1);
+            vec<Watcher>& ws = watches[p];
+            for (int j = 0; j < ws.size(); j++)
+                ca.reloc(ws[j].cref, to);
+        }
+
+    // All reasons:
+    //
+    for (int i = 0; i < trail.size(); i++){
+        Var v = var(trail[i]);
+
+        if (reason(v) != CRef_Undef && (ca[reason(v)].reloced() || locked(ca[reason(v)])))
+            ca.reloc(vardata[v].reason, to);
+    }
+
+    // All learnt:
+    //
+    for (int i = 0; i < learnts.size(); i++) {
+        old = learnts[i];
+        ca.reloc(learnts[i], to);
+        newUsedLearnt[learnts[i]] = allUsedClausesLearnt[old];
+    }
+    allUsedClausesLearnt = newUsedLearnt;
+
+    // All original:
+    //
+    for (int i = 0; i < clauses.size(); i++) {
+        old = clauses[i];
+        ca.reloc(clauses[i], to);
+        newUsedOriginal[clauses[i]] = allUsedClausesOriginal[old];
+    }
+    allUsedClausesOriginal = newUsedOriginal;
+}
+
+
+void Solver::garbageCollect()
+{
+    // Initialize the next region to a size corresponding to the estimated utilization degree. This
+    // is not precise but should avoid some unnecessary reallocations for the new region:
+    
+    ClauseAllocator to(ca.size() - ca.wasted()); 
+
+    relocAll(to);
+    if (verbosity >= 2)
+        printf("|  Garbage collection:   %12d bytes => %12d bytes             |\n", 
+               ca.size()*ClauseAllocator::Unit_Size, to.size()*ClauseAllocator::Unit_Size);
+    to.moveTo(ca);
+    
+}
